@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: 2026 The meson-python developers
+#
+# SPDX-License-Identifier: MIT
+
+[build-system]
+build-backend = 'mesonpy'
+requires = ['meson-python', 'dynamic-metadata']
+
+[project]
+name = 'dynamic-metadata-plugin'
+version = '1.0.0'
+dynamic = ['description', 'dependencies']
+
+[[tool.dynamic-metadata]]
+provider = {path = '.', module = 'plugin'}
+dependencies = ['dyn-dep >= 1']
+
+[[tool.dynamic-metadata]]
+provider = {path = '.', module = 'plugin'}
+dependencies = ['second-dep']

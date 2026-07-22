@@ -50,6 +50,7 @@ else:
 import packaging.utils
 import packaging.version
 import pyproject_metadata
+import pyproject_metadata.constants
 
 import mesonpy._rpath
 import mesonpy._tags
@@ -73,6 +74,7 @@ except ImportError:
 
 if typing.TYPE_CHECKING:  # pragma: no cover
     from collections.abc import Collection, Iterator, Mapping
+    from types import ModuleType
     from typing import Any, Callable, DefaultDict, Dict, List, Literal, Optional, Sequence, TextIO, Tuple, Type, TypeVar, Union
 
     from typing_extensions import ParamSpec, Self
@@ -95,6 +97,7 @@ _NINJA_REQUIRED_VERSION = '1.8.2'
 
 # Keep in sync with the version requirement in pyproject.toml
 _MESON_REQUIRED_VERSION = '0.64.0' if sys.version_info < (3, 12) else '1.2.3'
+_DYNAMIC_METADATA_REQUIRED_VERSION = '0.5'
 
 _MESON_ARGS_KEYS = ['dist', 'setup', 'compile', 'install']
 
@@ -627,6 +630,42 @@ def _validate_pyproject_config(pyproject: Dict[str, Any]) -> Dict[str, Any]:
     return scheme(table, 'tool.meson-python')
 
 
+def _dynamic_metadata_entries(pyproject: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return the [[tool.dynamic-metadata]] entries from pyproject.toml."""
+    entries = pyproject.get('tool', {}).get('dynamic-metadata', [])
+    if not isinstance(entries, list) or not all(isinstance(entry, dict) for entry in entries):
+        raise ConfigError('Configuration entry "tool.dynamic-metadata" must be an array of tables')
+    return entries
+
+
+def _import_dynamic_metadata_loader() -> ModuleType:
+    try:
+        import dynamic_metadata.loader
+    except ImportError:
+        raise ConfigError(
+            'pyproject.toml contains "[[tool.dynamic-metadata]]" entries but the "dynamic-metadata" package is not '
+            f'installed: add "dynamic-metadata >= {_DYNAMIC_METADATA_REQUIRED_VERSION}" to "build-system.requires"'
+        ) from None
+    return dynamic_metadata.loader
+
+
+def _process_dynamic_metadata(pyproject: Dict[str, Any], source_dir: pathlib.Path, build_state: str) -> Dict[str, Any]:
+    """Resolve [[tool.dynamic-metadata]] entries into the [project] table."""
+    entries = _dynamic_metadata_entries(pyproject)
+    if not entries:
+        return pyproject
+    if 'project' not in pyproject:
+        raise ConfigError('Using "[[tool.dynamic-metadata]]" entries requires a "[project]" section in pyproject.toml')
+    loader = _import_dynamic_metadata_loader()
+    try:
+        # plugins resolve relative paths against the current directory
+        with mesonpy._util.chdir(source_dir):
+            project = loader.process_dynamic_metadata(pyproject['project'], entries, build_state)
+    except (ImportError, KeyError, ValueError) as exc:
+        raise ConfigError(f'Could not process dynamic metadata: {exc.args[0] if exc.args else exc}') from exc
+    return {**pyproject, 'project': project}
+
+
 def _validate_config_settings(config_settings: Dict[str, Any]) -> Dict[str, Any]:
     """Validate options received from build frontend."""
 
@@ -696,8 +735,10 @@ class Project():
         build_dir: Path,
         meson_args: Optional[MesonArgs] = None,
         editable_verbose: Optional[bool] = None,
+        build_state: str = 'wheel',
     ) -> None:
         self._source_dir = pathlib.Path(source_dir).absolute()
+        self._build_state = build_state
         self._build_dir = pathlib.Path(build_dir).absolute()
         self._meson_native_file = self._build_dir / 'meson-python-native-file.ini'
         self._meson_cross_file = self._build_dir / 'meson-python-cross-file.ini'
@@ -856,6 +897,7 @@ class Project():
         self._configure(reconfigure=reconfigure)
 
         # package metadata
+        pyproject = _process_dynamic_metadata(pyproject, self._source_dir, build_state)
         if 'project' in pyproject:
             self._metadata = Metadata.from_pyproject(pyproject, self._source_dir)
             # set version from meson.build if version is declared as dynamic
@@ -889,6 +931,22 @@ class Project():
                 'license_files': self._meson_license_files
             } if _PYPROJECT_METADATA_VERSION >= (0, 9) else {}
             self._metadata = Metadata(name=name, version=packaging.version.Version(version), **kwargs)
+
+        # mark fields resolved by dynamic-metadata plugins at wheel build
+        # time as dynamic in the sdist PKG-INFO (metadata version 2.2)
+        if build_state == 'sdist':
+            entries = _dynamic_metadata_entries(pyproject)
+            if entries:
+                loader = _import_dynamic_metadata_loader()
+                try:
+                    with mesonpy._util.chdir(self._source_dir):
+                        fields = loader.dynamic_wheel_fields(entries)
+                except (ImportError, KeyError, ValueError) as exc:
+                    raise ConfigError(f'Could not process dynamic metadata: {exc.args[0] if exc.args else exc}') from exc
+                headers: set[str] = set()
+                for field in fields:
+                    headers.update(pyproject_metadata.constants.PROJECT_TO_METADATA[field])
+                self._metadata.dynamic_metadata = sorted(headers)
 
         # verify that we are running on a supported interpreter
         if self._metadata.requires_python:
@@ -1172,7 +1230,7 @@ class Project():
 
 
 @contextlib.contextmanager
-def _project(config_settings: Optional[Dict[Any, Any]] = None) -> Iterator[Project]:
+def _project(config_settings: Optional[Dict[Any, Any]] = None, build_state: str = 'wheel') -> Iterator[Project]:
     """Create the project given the given config settings."""
 
     settings = _validate_config_settings(config_settings or {})
@@ -1184,7 +1242,7 @@ def _project(config_settings: Optional[Dict[Any, Any]] = None) -> Iterator[Proje
     with contextlib.ExitStack() as ctx:
         if build_dir is None:
             build_dir = ctx.enter_context(tempfile.TemporaryDirectory(prefix='.mesonpy-', dir=source_dir))
-        yield Project(source_dir, build_dir, meson_args, editable_verbose)
+        yield Project(source_dir, build_dir, meson_args, editable_verbose, build_state)
 
 
 def _parse_version_string(string: str) -> Tuple[int, ...]:
@@ -1273,12 +1331,37 @@ def _pyproject_hook(func: Callable[P, T]) -> Callable[P, T]:
     return wrapper
 
 
+def _get_requires_for_dynamic_metadata() -> List[str]:
+    """Requirements to process the [[tool.dynamic-metadata]] entries, if any."""
+    try:
+        pyproject = tomllib.loads(pathlib.Path('pyproject.toml').read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return []
+    entries = _dynamic_metadata_entries(pyproject)
+    if not entries:
+        return []
+    dependencies = [f'dynamic-metadata >= {_DYNAMIC_METADATA_REQUIRED_VERSION}']
+    try:
+        import dynamic_metadata.loader
+    except ImportError:
+        # extra requirements declared by the plugins themselves can only be
+        # collected when dynamic-metadata is listed in "build-system.requires"
+        return dependencies
+    try:
+        dependencies += dynamic_metadata.loader.get_requires_for_dynamic_metadata(entries)
+    except (ImportError, KeyError, ValueError) as exc:
+        raise ConfigError(f'Could not process dynamic metadata: {exc.args[0] if exc.args else exc}') from exc
+    return dependencies
+
+
 @_pyproject_hook
 def get_requires_for_build_sdist(config_settings: Optional[Dict[str, str]] = None) -> List[str]:
     dependencies = []
 
     if os.environ.get('NINJA') is None and _env_ninja_command() is None:
         dependencies.append(f'ninja >= {_NINJA_REQUIRED_VERSION}')
+
+    dependencies += _get_requires_for_dynamic_metadata()
 
     return dependencies
 
@@ -1293,6 +1376,8 @@ def get_requires_for_build_wheel(config_settings: Optional[Dict[str, str]] = Non
     if sys.platform.startswith('linux') and not shutil.which('patchelf'):
         dependencies.append('patchelf >= 0.11.0')
 
+    dependencies += _get_requires_for_dynamic_metadata()
+
     return dependencies
 
 
@@ -1306,7 +1391,7 @@ def build_sdist(
 ) -> str:
 
     out = pathlib.Path(sdist_directory)
-    with _project(config_settings) as project:
+    with _project(config_settings, build_state='sdist') as project:
         return project.sdist(out).name
 
 
@@ -1336,5 +1421,5 @@ def build_editable(
         config_settings['build-dir'] = 'build/' + mesonpy._tags.get_abi_tag()
 
     out = pathlib.Path(wheel_directory)
-    with _project(config_settings) as project:
+    with _project(config_settings, build_state='editable') as project:
         return project.editable(out).name

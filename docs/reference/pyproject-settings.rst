@@ -13,6 +13,10 @@ This page lists the configuration settings supported by
 :ref:`how-to-guides-meson-args` guide for for information on how to
 use them and examples.
 
+``meson-python`` also supports dynamic-metadata plugins configured in
+``tool.dynamic-metadata`` entries, a specification shared with other build
+backends. See the :ref:`how-to-guides-dynamic-metadata` guide.
+
 .. option:: tool.meson-python.allow-windows-internal-shared-libs
 
    Enable support for relocating internal shared libraries that would be

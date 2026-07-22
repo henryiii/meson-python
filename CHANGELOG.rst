@@ -11,6 +11,17 @@
 Changelog
 +++++++++
 
+0.21.0
+======
+
+- Add support for dynamic-metadata_ plugins: package metadata fields declared
+  as dynamic can be computed at build time by plugins configured in
+  ``tool.dynamic-metadata`` entries in ``pyproject.toml``.  Requires the
+  ``dynamic-metadata`` package in ``build-system.requires``.
+
+.. _dynamic-metadata: https://pypi.org/project/dynamic-metadata/
+
+
 0.20.0
 ======
 
