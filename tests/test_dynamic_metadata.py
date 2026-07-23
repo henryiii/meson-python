@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: MIT
 
 import pathlib
+import shutil
 import sys
 import tarfile
 
@@ -13,7 +14,7 @@ import wheel.wheelfile
 
 import mesonpy
 
-from .conftest import metadata
+from .conftest import in_git_repo_context, metadata, package_dir
 
 
 pytest.importorskip('dynamic_metadata')
@@ -40,6 +41,28 @@ def test_sdist_metadata(sdist_dynamic_metadata_plugin):
     assert [x.lower() for x in meta['dynamic']] == ['requires-dist']
     assert meta['summary'] == 'a plugin described dynamic-metadata-plugin'
     assert meta['requires_dist'] == ['dyn-dep>=1', 'second-dep']
+
+
+def test_sdist_from_other_cwd(tmp_path, monkeypatch):
+    # a provider path relative to the source dir must resolve even when the
+    # Project is driven from a different working directory
+    source_dir = tmp_path / 'pkg'
+    shutil.copytree(package_dir / 'dynamic-metadata-plugin', source_dir)
+    source_dir.joinpath('scripts').mkdir()
+    source_dir.joinpath('plugin.py').rename(source_dir / 'scripts' / 'plugin.py')
+    pyproject = source_dir / 'pyproject.toml'
+    pyproject.write_text(pyproject.read_text().replace("path = '.'", "path = 'scripts'"))
+
+    monkeypatch.delitem(sys.modules, 'plugin', raising=False)
+    monkeypatch.chdir(tmp_path)
+    with in_git_repo_context(source_dir):
+        project = mesonpy.Project(source_dir, tmp_path / 'build', build_state='sdist')
+        sdist_path = project.sdist(tmp_path)
+
+    with tarfile.open(sdist_path, 'r:gz') as sdist:
+        pkg_info = sdist.extractfile('dynamic_metadata_plugin-1.0.0/PKG-INFO').read()
+    meta = metadata(pkg_info)
+    assert [x.lower() for x in meta['dynamic']] == ['requires-dist']
 
 
 def test_get_requires(package_dynamic_metadata_plugin):

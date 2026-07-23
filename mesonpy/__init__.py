@@ -50,7 +50,6 @@ else:
 import packaging.utils
 import packaging.version
 import pyproject_metadata
-import pyproject_metadata.constants
 
 import mesonpy._rpath
 import mesonpy._tags
@@ -776,8 +775,19 @@ class Project():
 
         # resolve dynamic-metadata plugins after the cheap configuration
         # checks but before the expensive meson setup
-        self._dynamic_metadata_entries = _dynamic_metadata_entries(pyproject)
+        dynamic_metadata_entries = _dynamic_metadata_entries(pyproject)
         pyproject = _process_dynamic_metadata(pyproject, self._source_dir, build_state)
+
+        # for sdists, collect the fields that plugins declare as computed at
+        # wheel build time, to mark them as dynamic in the PKG-INFO
+        dynamic_headers: List[str] = []
+        if dynamic_metadata_entries and build_state == 'sdist':
+            import dynamic_metadata.loader
+
+            from pyproject_metadata.constants import PROJECT_TO_METADATA
+            with _dynamic_metadata_errors(), mesonpy._util.chdir(self._source_dir):
+                fields = dynamic_metadata.loader.dynamic_wheel_fields(dynamic_metadata_entries)
+            dynamic_headers = sorted({header for field in fields for header in PROJECT_TO_METADATA[field]})
 
         # make sure the build dir exists
         self._build_dir.mkdir(exist_ok=True, parents=True)
@@ -936,6 +946,10 @@ class Project():
                 'license_files': self._meson_license_files
             } if _PYPROJECT_METADATA_VERSION >= (0, 9) else {}
             self._metadata = Metadata(name=name, version=packaging.version.Version(version), **kwargs)
+
+        # emit metadata version 2.2 with the sdist-dynamic fields collected above
+        if dynamic_headers:
+            self._metadata.dynamic_metadata = dynamic_headers
 
         # verify that we are running on a supported interpreter
         if self._metadata.requires_python:
@@ -1098,16 +1112,6 @@ class Project():
 
     def sdist(self, directory: Path) -> pathlib.Path:
         """Generates a sdist (source distribution) in the specified directory."""
-        # mark fields that dynamic-metadata plugins declare as computed at
-        # wheel build time as dynamic in the PKG-INFO (metadata version 2.2)
-        if self._dynamic_metadata_entries:
-            import dynamic_metadata.loader
-            with _dynamic_metadata_errors():
-                fields = dynamic_metadata.loader.dynamic_wheel_fields(self._dynamic_metadata_entries)
-            headers = {header for field in fields for header in pyproject_metadata.constants.PROJECT_TO_METADATA[field]}
-            if headers:
-                self._metadata.dynamic_metadata = sorted(headers)
-
         # Generate meson dist file.
         self._run(self._meson + ['dist', '--allow-dirty', '--no-tests', '--formats', 'gztar', *self._meson_args['dist']])
 
