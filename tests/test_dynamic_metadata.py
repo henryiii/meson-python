@@ -77,19 +77,17 @@ def test_unresolved_dynamic_field(package_dynamic_metadata_plugin):
             {'provider': {'path': '.', 'module': 'plugin'}, 'dependencies': ['a']},
         ]},
     }
-    processed, headers = mesonpy._process_dynamic_metadata(pyproject, source_dir, 'wheel')
+    processed = mesonpy._process_dynamic_metadata(pyproject, source_dir, 'wheel')
     assert processed['project']['dependencies'] == ['a']
     assert processed['project']['dynamic'] == ['keywords']
-    assert headers == []
     with pytest.raises(pyproject_metadata.ConfigurationError, match='Unsupported dynamic fields: "keywords"'):
         mesonpy.Metadata.from_pyproject(processed, source_dir)
 
 
 def test_no_entries_passthrough():
     pyproject = {'project': {'name': 'example', 'version': '1.0.0'}}
-    processed, headers = mesonpy._process_dynamic_metadata(pyproject, pathlib.Path(), 'wheel')
+    processed = mesonpy._process_dynamic_metadata(pyproject, pathlib.Path(), 'wheel')
     assert processed is pyproject
-    assert headers == []
 
 
 def test_malformed_config():
