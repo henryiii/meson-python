@@ -41,8 +41,16 @@ name, or a table like ``provider = {path = 'scripts', module = 'my_plugin'}``
 importing a local module, similar to the ``backend-path`` key in the
 ``build-system`` section.  All other keys in the entry are passed to the
 plugin as settings.  Entries are processed in order, and later entries can
-read the fields computed by earlier ones.  Refer to the `dynamic-metadata
-documentation`_ for the configuration of the individual plugins.
+read the fields computed by earlier ones.  The ``version`` field is resolved
+from ``meson.build`` before the plugins run, thus plugins can read it.  Refer
+to the `dynamic-metadata documentation`_ for the configuration of the
+individual plugins.
+
+The plugins run again when a wheel is built from the source distribution.  A
+local plugin module must thus be included in the source distribution: only
+files tracked by the version control system are.  Metadata fields that the
+plugins do not declare as computed at wheel build time (see below) must have
+the same value when computed from the source distribution.
 
 Listing ``dynamic-metadata`` in ``build-system.requires`` is recommended:
 extra build dependencies requested by the plugins themselves can only be
@@ -51,7 +59,8 @@ build requirements.
 
 Fields that plugins declare as computed at wheel build time via the
 ``dynamic_wheel()`` plugin hook are marked with ``Dynamic`` in the source
-distribution metadata, as specified by the `core metadata`_ version 2.2.
+distribution metadata, as specified by the `core metadata`_ version 2.2.  A
+plugin can leave such a field unset when building the source distribution.
 
 .. _dynamic-metadata: https://pypi.org/project/dynamic-metadata/
 .. _dynamic-metadata protocol: https://scikit-build.github.io/dynamic-metadata/

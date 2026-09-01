@@ -20,6 +20,7 @@ import difflib
 import fnmatch
 import functools
 import importlib.machinery
+import importlib.metadata
 import importlib.resources
 import io
 import itertools
@@ -36,6 +37,7 @@ import sysconfig
 import tarfile
 import tempfile
 import textwrap
+import types
 import typing
 import warnings
 
@@ -294,9 +296,10 @@ class Metadata(pyproject_metadata.StandardMetadata):
         cls,
         data: Mapping[str, Any],
         project_dir: Path = os.path.curdir,
-        metadata_version: Optional[str] = None
+        metadata_version: Optional[str] = None,
+        dynamic_metadata: Optional[List[str]] = None,
     ) -> Self:
-        metadata = super().from_pyproject(data, project_dir, metadata_version)
+        metadata = super().from_pyproject(data, project_dir, metadata_version, dynamic_metadata)
 
         # Check for unsupported dynamic fields.
         unsupported_dynamic = set(metadata.dynamic) - _SUPPORTED_DYNAMIC_FIELDS  # type: ignore[operator]
@@ -639,31 +642,56 @@ def _dynamic_metadata_entries(pyproject: Dict[str, Any]) -> List[Dict[str, Any]]
 
 @contextlib.contextmanager
 def _dynamic_metadata_errors() -> Iterator[None]:
-    """Translate dynamic-metadata plugin exceptions into ConfigError."""
+    """Translate exceptions raised by dynamic-metadata plugins into ConfigError."""
     try:
         yield
-    except (ImportError, KeyError, ValueError) as exc:
-        raise ConfigError(f'Could not process dynamic metadata: {exc.args[0] if exc.args else exc}') from exc
+    except Exception as exc:
+        # str() of a KeyError is the repr of the key
+        message = exc.args[0] if isinstance(exc, KeyError) and exc.args else str(exc)
+        raise ConfigError(f'Could not process dynamic metadata: {type(exc).__name__}: {message}') from exc
 
 
-def _process_dynamic_metadata(pyproject: Dict[str, Any], source_dir: pathlib.Path, build_state: BuildState) -> Dict[str, Any]:
-    """Resolve [[tool.dynamic-metadata]] entries into the [project] table."""
-    entries = _dynamic_metadata_entries(pyproject)
-    if not entries:
-        return pyproject
-    if 'project' not in pyproject:
-        raise ConfigError('Using "[[tool.dynamic-metadata]]" entries requires a "[project]" section in pyproject.toml')
+def _dynamic_metadata_loader() -> types.ModuleType:
+    """Import the dynamic_metadata.loader module, checking the package version."""
+    hint = f'add "dynamic-metadata >= {_DYNAMIC_METADATA_REQUIRED_VERSION}" to "build-system.requires"'
     try:
         import dynamic_metadata.loader
     except ImportError:
         raise ConfigError(
             'pyproject.toml contains "[[tool.dynamic-metadata]]" entries but the "dynamic-metadata" package is not '
-            f'installed: add "dynamic-metadata >= {_DYNAMIC_METADATA_REQUIRED_VERSION}" to "build-system.requires"'
-        ) from None
+            f'installed: {hint}') from None
+    version = importlib.metadata.version('dynamic-metadata')
+    if packaging.version.Version(version) < packaging.version.Version(_DYNAMIC_METADATA_REQUIRED_VERSION):
+        raise ConfigError(f'dynamic-metadata {version} is too old: {hint}')
+    return dynamic_metadata.loader
+
+
+def _process_dynamic_metadata(
+    pyproject: Dict[str, Any], source_dir: pathlib.Path, build_state: BuildState
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Resolve [[tool.dynamic-metadata]] entries into the [project] table.
+
+    Returns the updated pyproject.toml data and, for sdists, the core
+    metadata fields that plugins declare as computed at wheel build time.
+    """
+    entries = _dynamic_metadata_entries(pyproject)
+    if not entries:
+        return pyproject, []
+    if 'project' not in pyproject:
+        raise ConfigError('Using "[[tool.dynamic-metadata]]" entries requires a "[project]" section in pyproject.toml')
+    loader = _dynamic_metadata_loader()
     # plugins resolve relative paths against the current directory
     with _dynamic_metadata_errors(), mesonpy._util.chdir(source_dir):
-        project = dynamic_metadata.loader.process_dynamic_metadata(pyproject['project'], entries, build_state)
-    return {**pyproject, 'project': project}
+        project = loader.process_dynamic_metadata(pyproject['project'], entries, build_state)
+        wheel_fields = loader.dynamic_wheel_fields(entries) if build_state == 'sdist' else set()
+    # fields left dynamic are computed at wheel build time or from meson.build
+    unset = set(project['dynamic']) - wheel_fields - _SUPPORTED_DYNAMIC_FIELDS
+    if unset:
+        fields = ', '.join(f'"{x}"' for x in sorted(unset))
+        raise ConfigError(f'Fields declared as dynamic but not set by any dynamic-metadata plugin: {fields}')
+    project['dynamic'] = [x for x in project['dynamic'] if x not in wheel_fields]
+    dynamic_headers = sorted({header for field in wheel_fields for header in pyproject_metadata.field_to_metadata(field)})
+    return {**pyproject, 'project': project}, dynamic_headers
 
 
 def _validate_config_settings(config_settings: Dict[str, Any]) -> Dict[str, Any]:
@@ -773,21 +801,9 @@ class Project():
             raise ConfigError(f'Could not find ninja version {_NINJA_REQUIRED_VERSION} or newer.')
         os.environ.setdefault('NINJA', self._ninja)
 
-        # resolve dynamic-metadata plugins after the cheap configuration
-        # checks but before the expensive meson setup
-        dynamic_metadata_entries = _dynamic_metadata_entries(pyproject)
-        pyproject = _process_dynamic_metadata(pyproject, self._source_dir, build_state)
-
-        # for sdists, collect the fields that plugins declare as computed at
-        # wheel build time, to mark them as dynamic in the PKG-INFO
-        dynamic_headers: List[str] = []
-        if dynamic_metadata_entries and build_state == 'sdist':
-            import dynamic_metadata.loader
-
-            from pyproject_metadata.constants import PROJECT_TO_METADATA
-            with _dynamic_metadata_errors(), mesonpy._util.chdir(self._source_dir):
-                fields = dynamic_metadata.loader.dynamic_wheel_fields(dynamic_metadata_entries)
-            dynamic_headers = sorted({header for field in fields for header in PROJECT_TO_METADATA[field]})
+        # validate the plugin configuration before the expensive meson setup
+        _dynamic_metadata_entries(pyproject)
+        self._pyproject = pyproject
 
         # make sure the build dir exists
         self._build_dir.mkdir(exist_ok=True, parents=True)
@@ -912,16 +928,49 @@ class Project():
         # run meson setup
         self._configure(reconfigure=reconfigure)
 
-        # package metadata
+        # limited API
+        self._limited_api = pyproject_config.get('limited-api', False)
+        if self._limited_api:
+            # check whether limited API is disabled for the Meson project
+            options = self._info('intro-buildoptions')
+            allow_limited_api = next((opt['value'] for opt in options if opt['name'] == 'python.allow_limited_api'), None)
+            if not allow_limited_api:
+                self._limited_api = False
+
+        if self._limited_api and bool(sysconfig.get_config_var('Py_GIL_DISABLED')) and sys.version_info < (3, 15):
+            raise BuildError(
+                'The package targets Python\'s Limited API, which is not supported by free-threaded CPython before version '
+                '3.15. The "python.allow_limited_api" Meson build option may be used to override the package default.')
+
+        # Shared library support on Windows requires collaboration
+        # from the package, make sure the developers acknowledge this.
+        self._allow_windows_shared_libs = pyproject_config.get('allow-windows-internal-shared-libs', False)
+
+        # Files to be excluded from the wheel
+        self._excluded_files = pyproject_config.get('wheel', {}).get('exclude', [])
+        self._included_files = pyproject_config.get('wheel', {}).get('include', [])
+
+        self._resolve_metadata(build_state)
+
+    def _resolve_metadata(self, build_state: BuildState) -> None:
+        """Compute the package metadata for the given build state."""
+        pyproject = self._pyproject
         if 'project' in pyproject:
-            self._metadata = Metadata.from_pyproject(pyproject, self._source_dir)
-            # set version from meson.build if version is declared as dynamic
-            if 'version' in self._metadata.dynamic:
+            project = dict(pyproject['project'])
+            dynamic = list(project.get('dynamic', []))
+            # resolve the version from meson.build before running the
+            # dynamic-metadata plugins, so that the plugins can read it
+            if 'version' in dynamic:
                 version = self._meson_version
                 if version is None:
                     raise pyproject_metadata.ConfigurationError(
                         'Field "version" declared as dynamic but version is not defined in meson.build')
-                self._metadata.version = packaging.version.Version(version)
+                project['version'] = version
+                dynamic.remove('version')
+            project['dynamic'] = dynamic
+            pyproject = {**pyproject, 'project': project}
+            pyproject, dynamic_headers = _process_dynamic_metadata(pyproject, self._source_dir, build_state)
+            self._metadata = Metadata.from_pyproject(pyproject, self._source_dir, dynamic_metadata=dynamic_headers)
             if 'license' in self._metadata.dynamic:
                 license = self._meson_license
                 if license is None:
@@ -947,10 +996,6 @@ class Project():
             } if _PYPROJECT_METADATA_VERSION >= (0, 9) else {}
             self._metadata = Metadata(name=name, version=packaging.version.Version(version), **kwargs)
 
-        # emit metadata version 2.2 with the sdist-dynamic fields collected above
-        if dynamic_headers:
-            self._metadata.dynamic_metadata = dynamic_headers
-
         # verify that we are running on a supported interpreter
         if self._metadata.requires_python:
             self._metadata.requires_python.prereleases = True
@@ -959,27 +1004,7 @@ class Project():
                     f'The package requires Python version {self._metadata.requires_python}, '
                     f'running on {platform.python_version()}')
 
-        # limited API
-        self._limited_api = pyproject_config.get('limited-api', False)
-        if self._limited_api:
-            # check whether limited API is disabled for the Meson project
-            options = self._info('intro-buildoptions')
-            allow_limited_api = next((opt['value'] for opt in options if opt['name'] == 'python.allow_limited_api'), None)
-            if not allow_limited_api:
-                self._limited_api = False
-
-        if self._limited_api and bool(sysconfig.get_config_var('Py_GIL_DISABLED')) and sys.version_info < (3, 15):
-            raise BuildError(
-                'The package targets Python\'s Limited API, which is not supported by free-threaded CPython before version '
-                '3.15. The "python.allow_limited_api" Meson build option may be used to override the package default.')
-
-        # Shared library support on Windows requires collaboration
-        # from the package, make sure the developers acknowledge this.
-        self._allow_windows_shared_libs = pyproject_config.get('allow-windows-internal-shared-libs', False)
-
-        # Files to be excluded from the wheel
-        self._excluded_files = pyproject_config.get('wheel', {}).get('exclude', [])
-        self._included_files = pyproject_config.get('wheel', {}).get('include', [])
+        self._build_state = build_state
 
     def _run(self, cmd: Sequence[str]) -> None:
         """Invoke a subprocess."""
@@ -1112,6 +1137,8 @@ class Project():
 
     def sdist(self, directory: Path) -> pathlib.Path:
         """Generates a sdist (source distribution) in the specified directory."""
+        if self._build_state != 'sdist':
+            self._resolve_metadata('sdist')
         # Generate meson dist file.
         self._run(self._meson + ['dist', '--allow-dirty', '--no-tests', '--formats', 'gztar', *self._meson_args['dist']])
 
@@ -1221,12 +1248,16 @@ class Project():
 
     def wheel(self, directory: Path) -> pathlib.Path:
         """Generates a wheel in the specified directory."""
+        if self._build_state != 'wheel':
+            self._resolve_metadata('wheel')
         self.build()
         builder = _WheelBuilder(self._metadata, self._manifest, self._limited_api, self._allow_windows_shared_libs)
         return builder.build(directory)
 
     def editable(self, directory: Path) -> pathlib.Path:
         """Generates an editable wheel in the specified directory."""
+        if self._build_state != 'editable':
+            self._resolve_metadata('editable')
         self.build()
         builder = _EditableWheelBuilder(self._metadata, self._manifest, self._limited_api, self._allow_windows_shared_libs)
         return builder.build(directory, self._source_dir, self._build_dir, self._build_command, self._editable_verbose)
@@ -1342,13 +1373,17 @@ def _get_requires_for_dynamic_metadata() -> List[str]:
         return []
     dependencies = [f'dynamic-metadata >= {_DYNAMIC_METADATA_REQUIRED_VERSION}']
     try:
-        import dynamic_metadata.loader
-    except ImportError:
+        loader = _dynamic_metadata_loader()
+    except ConfigError:
         # extra requirements declared by the plugins themselves can only be
         # collected when dynamic-metadata is listed in "build-system.requires"
         return dependencies
     with _dynamic_metadata_errors():
-        dependencies += dynamic_metadata.loader.get_requires_for_dynamic_metadata(entries)
+        try:
+            dependencies += loader.get_requires_for_dynamic_metadata(entries)
+        except ImportError:
+            # a plugin may import a package that it declares as a requirement
+            pass
     return dependencies
 
 
