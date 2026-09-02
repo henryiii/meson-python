@@ -51,7 +51,7 @@ changelog = 'https://mesonbuild.com/meson-python/changelog.html'
 [dependency-groups]
 test = [
   'build',
-  'dynamic-metadata >= 0.5',
+  'dynamic-metadata >= 0.6',
   'pytest >= 6.0',
   'pytest-cov',
   'pytest-mock',

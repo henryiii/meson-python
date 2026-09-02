@@ -102,7 +102,7 @@ def test_unresolved_dynamic_field(package_dynamic_metadata_plugin):
             {'provider': {'path': '.', 'module': 'plugin'}, 'dependencies': ['a']},
         ]},
     }
-    with pytest.raises(mesonpy.ConfigError, match='not set by any dynamic-metadata plugin: "keywords"'):
+    with pytest.raises(mesonpy.ConfigError, match='not set by any dynamic-metadata provider: keywords'):
         mesonpy._process_dynamic_metadata(pyproject, source_dir, 'wheel')
 
 
@@ -114,8 +114,9 @@ def test_no_entries_passthrough():
 
 
 def test_malformed_config():
-    with pytest.raises(mesonpy.ConfigError, match='"tool.dynamic-metadata" must be an array of tables'):
-        mesonpy._dynamic_metadata_entries({'tool': {'dynamic-metadata': 'nope'}})
+    pyproject = {'project': {'name': 'example'}, 'tool': {'dynamic-metadata': 'nope'}}
+    with pytest.raises(mesonpy.ConfigError, match='tool.dynamic-metadata must be an array of tables'):
+        mesonpy._process_dynamic_metadata(pyproject, pathlib.Path(), 'wheel')
 
 
 PLUGIN_PYPROJECT = '''
@@ -145,6 +146,28 @@ def plugin_project(tmp_path, monkeypatch):
         importlib.invalidate_caches()
         return tmp_path
     return make
+
+
+TESTING_PROVIDER_PYPROJECT = '''
+[build-system]
+build-backend = 'mesonpy'
+requires = ['meson-python', 'dynamic-metadata']
+
+[project]
+name = 'example'
+dynamic = ['version', 'description']
+
+[[tool.dynamic-metadata]]
+provider = 'dynamic_metadata.testing'
+fields = {description = "{project[name]} built as {build_state}"}
+'''
+
+
+def test_entry_point_provider(plugin_project):
+    # a provider registered under the dynamic_metadata.provider entry-point group
+    source_dir = plugin_project('', pyproject=TESTING_PROVIDER_PYPROJECT)
+    project = mesonpy.Project(source_dir, source_dir / 'build')
+    assert project._metadata.description == 'example built as wheel'
 
 
 def test_plugin_sees_meson_version(plugin_project):
@@ -220,7 +243,7 @@ def test_unset_dynamic_field(plugin_project):
         def dynamic_metadata(settings, project):
             return {'description': 'x'}
     ''')
-    with pytest.raises(mesonpy.ConfigError, match='not set by any dynamic-metadata plugin: "dependencies"'):
+    with pytest.raises(mesonpy.ConfigError, match='not set by any dynamic-metadata provider: dependencies'):
         mesonpy.Project(source_dir, source_dir / 'build')
 
 
