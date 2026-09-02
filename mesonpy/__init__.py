@@ -643,11 +643,10 @@ def _dynamic_metadata_errors() -> Iterator[None]:
     import dynamic_metadata.errors
     try:
         yield
-    except dynamic_metadata.errors.DynamicMetadataError as exc:
-        raise ConfigError(f'Could not process dynamic metadata: {exc}') from exc
     except Exception as exc:
         # an exception raised inside a plugin hook propagates unwrapped from the loader
-        raise ConfigError(f'Could not process dynamic metadata: {type(exc).__name__}: {exc}') from exc
+        prefix = '' if isinstance(exc, dynamic_metadata.errors.DynamicMetadataError) else f'{type(exc).__name__}: '
+        raise ConfigError(f'Could not process dynamic metadata: {prefix}{exc}') from exc
 
 
 def _dynamic_metadata_loader() -> types.ModuleType:
@@ -666,16 +665,15 @@ def _dynamic_metadata_loader() -> types.ModuleType:
 
 
 def _process_dynamic_metadata(
-    pyproject: Dict[str, Any], source_dir: pathlib.Path, build_state: BuildState
+    loader: Optional[types.ModuleType], pyproject: Dict[str, Any], source_dir: pathlib.Path, build_state: BuildState
 ) -> Tuple[Dict[str, Any], List[str]]:
     """Resolve [[tool.dynamic-metadata]] entries into the [project] table.
 
     Returns the updated pyproject.toml data and, for sdists, the core
     metadata fields that plugins declare as computed at wheel build time.
     """
-    if not _has_dynamic_metadata_entries(pyproject):
+    if loader is None:
         return pyproject, []
-    loader = _dynamic_metadata_loader()
     # the loader and the plugins resolve relative paths against the current directory;
     # fields left dynamic by the plugins are resolved at wheel build time or from meson.build
     with _dynamic_metadata_errors(), mesonpy._util.chdir(source_dir):
@@ -791,11 +789,13 @@ class Project():
         os.environ.setdefault('NINJA', self._ninja)
 
         # validate the plugin configuration before the expensive meson setup
+        self._dynamic_metadata_loader = None
         if _has_dynamic_metadata_entries(pyproject):
-            loader = _dynamic_metadata_loader()
+            self._dynamic_metadata_loader = _dynamic_metadata_loader()
             with _dynamic_metadata_errors():
-                loader.entries_from_pyproject(pyproject)
+                self._dynamic_metadata_loader.entries_from_pyproject(pyproject)
         self._pyproject = pyproject
+        self._build_state: Optional[BuildState] = None
 
         # make sure the build dir exists
         self._build_dir.mkdir(exist_ok=True, parents=True)
@@ -946,22 +946,22 @@ class Project():
 
     def _resolve_metadata(self, build_state: BuildState) -> None:
         """Compute the package metadata for the given build state."""
+        if build_state == self._build_state:
+            return
         pyproject = self._pyproject
         if 'project' in pyproject:
             project = dict(pyproject['project'])
-            dynamic = list(project.get('dynamic', []))
             # resolve the version from meson.build before running the
             # dynamic-metadata plugins, so that the plugins can read it
-            if 'version' in dynamic:
+            if 'version' in project.get('dynamic', []):
                 version = self._meson_version
                 if version is None:
                     raise pyproject_metadata.ConfigurationError(
                         'Field "version" declared as dynamic but version is not defined in meson.build')
                 project['version'] = version
-                dynamic.remove('version')
-            project['dynamic'] = dynamic
-            pyproject = {**pyproject, 'project': project}
-            pyproject, dynamic_headers = _process_dynamic_metadata(pyproject, self._source_dir, build_state)
+                project['dynamic'] = [x for x in project['dynamic'] if x != 'version']
+            pyproject, dynamic_headers = _process_dynamic_metadata(
+                self._dynamic_metadata_loader, {**pyproject, 'project': project}, self._source_dir, build_state)
             self._metadata = Metadata.from_pyproject(pyproject, self._source_dir, dynamic_metadata=dynamic_headers)
             if 'license' in self._metadata.dynamic:
                 license = self._meson_license
@@ -1129,8 +1129,7 @@ class Project():
 
     def sdist(self, directory: Path) -> pathlib.Path:
         """Generates a sdist (source distribution) in the specified directory."""
-        if self._build_state != 'sdist':
-            self._resolve_metadata('sdist')
+        self._resolve_metadata('sdist')
         # Generate meson dist file.
         self._run(self._meson + ['dist', '--allow-dirty', '--no-tests', '--formats', 'gztar', *self._meson_args['dist']])
 
@@ -1240,16 +1239,14 @@ class Project():
 
     def wheel(self, directory: Path) -> pathlib.Path:
         """Generates a wheel in the specified directory."""
-        if self._build_state != 'wheel':
-            self._resolve_metadata('wheel')
+        self._resolve_metadata('wheel')
         self.build()
         builder = _WheelBuilder(self._metadata, self._manifest, self._limited_api, self._allow_windows_shared_libs)
         return builder.build(directory)
 
     def editable(self, directory: Path) -> pathlib.Path:
         """Generates an editable wheel in the specified directory."""
-        if self._build_state != 'editable':
-            self._resolve_metadata('editable')
+        self._resolve_metadata('editable')
         self.build()
         builder = _EditableWheelBuilder(self._metadata, self._manifest, self._limited_api, self._allow_windows_shared_libs)
         return builder.build(directory, self._source_dir, self._build_dir, self._build_command, self._editable_verbose)

@@ -7,7 +7,6 @@ import importlib.metadata
 import pathlib
 import shutil
 import sys
-import tarfile
 import textwrap
 
 import packaging.requirements
@@ -16,10 +15,12 @@ import wheel.wheelfile
 
 import mesonpy
 
-from .conftest import in_git_repo_context, metadata, package_dir
+from .conftest import in_git_repo_context, metadata, package_dir, sdist_metadata
 
 
 pytest.importorskip('dynamic_metadata')
+
+BASE_REQUIRES = [f'dynamic-metadata >= {mesonpy._DYNAMIC_METADATA_REQUIRED_VERSION}']
 
 
 def test_wheel_metadata(wheel_dynamic_metadata_plugin):
@@ -34,9 +35,7 @@ def test_wheel_metadata(wheel_dynamic_metadata_plugin):
 
 
 def test_sdist_metadata(sdist_dynamic_metadata_plugin):
-    with tarfile.open(sdist_dynamic_metadata_plugin, 'r:gz') as sdist:
-        pkg_info = sdist.extractfile('dynamic_metadata_plugin-1.0.0/PKG-INFO').read()
-    meta = metadata(pkg_info)
+    meta = sdist_metadata(sdist_dynamic_metadata_plugin, 'dynamic_metadata_plugin-1.0.0')
 
     assert meta['metadata_version'] == '2.2'
     # fields reported by the dynamic_wheel() plugin hook are marked dynamic
@@ -61,9 +60,7 @@ def test_sdist_from_other_cwd(tmp_path, monkeypatch):
         project = mesonpy.Project(source_dir, tmp_path / 'build', build_state='sdist')
         sdist_path = project.sdist(tmp_path)
 
-    with tarfile.open(sdist_path, 'r:gz') as sdist:
-        pkg_info = sdist.extractfile('dynamic_metadata_plugin-1.0.0/PKG-INFO').read()
-    meta = metadata(pkg_info)
+    meta = sdist_metadata(sdist_path, 'dynamic_metadata_plugin-1.0.0')
     assert [x.lower() for x in meta['dynamic']] == ['requires-dist']
 
 
@@ -76,47 +73,12 @@ def test_get_requires(package_dynamic_metadata_plugin):
 
 def test_missing_dynamic_metadata_package(monkeypatch, package_dynamic_metadata_plugin):
     monkeypatch.setitem(sys.modules, 'dynamic_metadata', None)
-    monkeypatch.setitem(sys.modules, 'dynamic_metadata.loader', None)
 
-    pyproject = {
-        'project': {'name': 'example', 'version': '1.0.0', 'dynamic': ['dependencies']},
-        'tool': {'dynamic-metadata': [{'provider': 'does.not.matter'}]},
-    }
     with pytest.raises(mesonpy.ConfigError, match='add "dynamic-metadata >= [0-9.]+" to "build-system.requires"'):
-        mesonpy._process_dynamic_metadata(pyproject, pathlib.Path(), 'wheel')
+        mesonpy.Project(package_dynamic_metadata_plugin, package_dynamic_metadata_plugin / 'build')
 
     # the requirement is returned so that the build step can import the package
-    requirements = mesonpy._get_requires_for_dynamic_metadata()
-    assert requirements == [f'dynamic-metadata >= {mesonpy._DYNAMIC_METADATA_REQUIRED_VERSION}']
-
-
-def test_unresolved_dynamic_field(package_dynamic_metadata_plugin):
-    source_dir = package_dynamic_metadata_plugin
-    pyproject = {
-        'project': {
-            'name': 'example',
-            'version': '1.0.0',
-            'dynamic': ['description', 'dependencies', 'keywords'],
-        },
-        'tool': {'dynamic-metadata': [
-            {'provider': {'path': '.', 'module': 'plugin'}, 'dependencies': ['a']},
-        ]},
-    }
-    with pytest.raises(mesonpy.ConfigError, match='not set by any dynamic-metadata provider: keywords'):
-        mesonpy._process_dynamic_metadata(pyproject, source_dir, 'wheel')
-
-
-def test_no_entries_passthrough():
-    pyproject = {'project': {'name': 'example', 'version': '1.0.0'}}
-    processed, dynamic_headers = mesonpy._process_dynamic_metadata(pyproject, pathlib.Path(), 'wheel')
-    assert processed is pyproject
-    assert dynamic_headers == []
-
-
-def test_malformed_config():
-    pyproject = {'project': {'name': 'example'}, 'tool': {'dynamic-metadata': 'nope'}}
-    with pytest.raises(mesonpy.ConfigError, match='tool.dynamic-metadata must be an array of tables'):
-        mesonpy._process_dynamic_metadata(pyproject, pathlib.Path(), 'wheel')
+    assert mesonpy._get_requires_for_dynamic_metadata() == BASE_REQUIRES
 
 
 PLUGIN_PYPROJECT = '''
@@ -163,6 +125,14 @@ fields = {description = "{project[name]} built as {build_state}"}
 '''
 
 
+def test_malformed_config(plugin_project):
+    # the configuration is validated before meson setup runs
+    source_dir = plugin_project('', pyproject=PLUGIN_PYPROJECT.replace('[[tool.dynamic-metadata]]', '[tool.dynamic-metadata]'))
+    with pytest.raises(mesonpy.ConfigError, match='tool.dynamic-metadata must be an array of tables'):
+        mesonpy.Project(source_dir, source_dir / 'build')
+    assert not source_dir.joinpath('build').exists()
+
+
 def test_entry_point_provider(plugin_project):
     # a provider registered under the dynamic_metadata.provider entry-point group
     source_dir = plugin_project('', pyproject=TESTING_PROVIDER_PYPROJECT)
@@ -202,8 +172,7 @@ def test_field_deferred_to_wheel(plugin_project):
     ''')
     with in_git_repo_context(source_dir):
         sdist_path = mesonpy.Project(source_dir, source_dir / 'build', build_state='sdist').sdist(source_dir)
-    with tarfile.open(sdist_path, 'r:gz') as sdist:
-        meta = metadata(sdist.extractfile('example-1.2.3/PKG-INFO').read())
+    meta = sdist_metadata(sdist_path, 'example-1.2.3')
     assert [x.lower() for x in meta['dynamic']] == ['requires-dist']
     assert 'requires_dist' not in meta
 
@@ -223,8 +192,7 @@ def test_sdist_from_default_build_state(plugin_project):
     ''')
     with in_git_repo_context(source_dir):
         sdist_path = mesonpy.Project(source_dir, source_dir / 'build').sdist(source_dir)
-    with tarfile.open(sdist_path, 'r:gz') as sdist:
-        meta = metadata(sdist.extractfile('example-1.2.3/PKG-INFO').read())
+    meta = sdist_metadata(sdist_path, 'example-1.2.3')
     assert [x.lower() for x in meta['dynamic']] == ['requires-dist']
 
 
@@ -256,8 +224,7 @@ def test_get_requires_plugin_import_error(plugin_project):
         def dynamic_metadata(settings, project):
             return {}
     ''')
-    assert mesonpy._get_requires_for_dynamic_metadata() == [
-        f'dynamic-metadata >= {mesonpy._DYNAMIC_METADATA_REQUIRED_VERSION}']
+    assert mesonpy._get_requires_for_dynamic_metadata() == BASE_REQUIRES
 
 
 def test_old_dynamic_metadata_package(monkeypatch, package_dynamic_metadata_plugin):
@@ -265,5 +232,4 @@ def test_old_dynamic_metadata_package(monkeypatch, package_dynamic_metadata_plug
     with pytest.raises(mesonpy.ConfigError, match='dynamic-metadata 0.4.0 is too old'):
         mesonpy.Project(package_dynamic_metadata_plugin, package_dynamic_metadata_plugin / 'build')
     # the requirements hook returns the requirement so that a suitable version can be installed
-    assert mesonpy._get_requires_for_dynamic_metadata() == [
-        f'dynamic-metadata >= {mesonpy._DYNAMIC_METADATA_REQUIRED_VERSION}']
+    assert mesonpy._get_requires_for_dynamic_metadata() == BASE_REQUIRES

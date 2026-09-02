@@ -13,14 +13,13 @@ import pytest
 
 import mesonpy
 
-from .conftest import MESON_VERSION, in_git_repo_context, metadata
+from .conftest import MESON_VERSION, in_git_repo_context, metadata, sdist_metadata
 
 
 def test_meson_build_metadata(sdist_library):
-    with tarfile.open(sdist_library, 'r:gz') as sdist:
-        sdist_pkg_info = sdist.extractfile('library-1.0.0/PKG-INFO').read()
+    meta = sdist_metadata(sdist_library, 'library-1.0.0')
 
-    assert metadata(sdist_pkg_info) == metadata(textwrap.dedent('''\
+    assert meta == metadata(textwrap.dedent('''\
         Metadata-Version: 2.1
         Name: library
         Version: 1.0.0
@@ -28,10 +27,8 @@ def test_meson_build_metadata(sdist_library):
 
 
 def test_pep621_metadata(sdist_full_metadata):
-    with tarfile.open(sdist_full_metadata, 'r:gz') as sdist:
-        sdist_pkg_info = sdist.extractfile('full_metadata-1.2.3/PKG-INFO').read()
+    meta = sdist_metadata(sdist_full_metadata, 'full_metadata-1.2.3')
 
-    meta = metadata(sdist_pkg_info)
     # Including the trailing newline in the expected value is inconvenient.
     meta['license'] = meta['license'].rstrip()
 
@@ -73,10 +70,9 @@ def test_pep621_metadata(sdist_full_metadata):
 
 
 def test_dynamic_version(sdist_dynamic_version):
-    with tarfile.open(sdist_dynamic_version, 'r:gz') as sdist:
-        sdist_pkg_info = sdist.extractfile('dynamic_version-1.0.0/PKG-INFO').read()
+    meta = sdist_metadata(sdist_dynamic_version, 'dynamic_version-1.0.0')
 
-    assert metadata(sdist_pkg_info) == metadata(textwrap.dedent('''\
+    assert meta == metadata(textwrap.dedent('''\
         Metadata-Version: 2.1
         Name: dynamic-version
         Version: 1.0.0

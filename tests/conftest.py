@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+import tarfile
 import tempfile
 import warnings
 
@@ -37,6 +38,12 @@ if sys.version_info <= (3, 8, 7):
         EXT_SUFFIX = get_config_var('EXT_SUFFIX')
 
 FREE_THREADED_BUILD = bool(sysconfig.get_config_var('Py_GIL_DISABLED'))
+
+
+def sdist_metadata(path, name):
+    """Parse the PKG-INFO of the sdist at path for the given name-version."""
+    with tarfile.open(path, 'r:gz') as sdist:
+        return metadata(sdist.extractfile(f'{name}/PKG-INFO').read())
 
 
 def metadata(data):
